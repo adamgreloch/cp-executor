@@ -58,13 +58,10 @@ enum command get_command(char* str)
     return QUIT;
 }
 
-void* run(Task* t)
+void run(Task* t)
 {
-    pid_t pid;
-    if ((pid = fork()) == 0) {
-        execvp(t->args[1], t->args + 1);
-        free_split_string(t->args);
-    }
+    execvp(t->args[1], t->args + 1);
+    free_split_string(t->args);
 }
 
 int main()
@@ -79,7 +76,9 @@ int main()
     }
 
     bool quits = false;
-    size_t next_task = 0;
+    int next_task = 0;
+
+    pid_t pid;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
@@ -94,8 +93,15 @@ int main()
         switch (get_command(parts[0])) {
         case RUN:
             tasks[next_task].args = parts;
-            ASSERT_ZERO(pthread_create(&tasks[next_task].thread, NULL, (void*)run, (void*)&tasks[next_task]));
-            next_task++;
+            if ((pid = fork()) < 0)
+                exit(1);
+            else if (pid == 0) {
+                run(&tasks[next_task]);
+                return 0;
+            } else {
+                printf("Task %d started: pid %d\n", next_task, pid);
+                next_task++;
+            }
             break;
         case OUT:
             break;
