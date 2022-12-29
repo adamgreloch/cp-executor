@@ -1,9 +1,12 @@
 #include "err.h"
 #include "utils.h"
+#include <fcntl.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define COMMAND_LENGTH 511
@@ -13,13 +16,16 @@
 struct Task {
     pthread_t thread;
     char** args;
-    char* stdout[LINE_LENGTH];
-    char* stderr[LINE_LENGTH];
+    char stdout[LINE_LENGTH];
+    char stderr[LINE_LENGTH];
+    sem_t mutex;
 };
 
 typedef struct Task Task;
 
-Task tasks[MAX_N_TASKS];
+struct SharedStorage {
+    Task tasks[MAX_N_TASKS];
+};
 
 enum command {
     RUN,
@@ -35,6 +41,9 @@ char* out_str = "out";
 char* err_str = "err";
 char* kill_str = "kill";
 char* sleep_str = "sleep";
+
+char mutex_names[MAX_N_TASKS][20];
+const char* mutex_name = "/executor_mutex";
 
 void remove_newline(char* str)
 {
@@ -58,10 +67,39 @@ enum command get_command(char* str)
     return QUIT;
 }
 
-void run(Task* t)
+void run(int t, struct SharedStorage* s)
 {
-    execvp(t->args[1], t->args + 1);
-    free_split_string(t->args);
+    int pipefd[2];
+    Task* task = &s->tasks[t];
+
+    ASSERT_SYS_OK(pipe(pipefd));
+
+    pid_t pid = fork();
+    ASSERT_SYS_OK(pid);
+
+    if (pid == 0) {
+        ASSERT_SYS_OK(close(pipefd[0]));
+
+        ASSERT_SYS_OK(dup2(pipefd[1], STDOUT_FILENO));
+        ASSERT_SYS_OK(close(pipefd[1]));
+
+        ASSERT_ZERO(execvp(task->args[1], task->args + 1));
+    } else {
+        ASSERT_SYS_OK(close(pipefd[1]));
+
+        FILE* fstream = fdopen(pipefd[0], "r");
+
+        char* buff = calloc(LINE_LENGTH, sizeof(char));
+
+        while (read_line(buff, LINE_LENGTH, fstream))
+            if (buff[0] != '\0') {
+                remove_newline(buff);
+                strcpy(task->stdout, buff);
+            }
+
+        free(buff);
+        free_split_string(task->args);
+    }
 }
 
 int main()
@@ -70,15 +108,34 @@ int main()
     char* buffer = malloc(buffer_size * sizeof(char));
     char** parts;
 
-    if (!buffer) {
-        perror("Failed to allocate input buffer");
-        exit(1);
+    if (!buffer)
+        syserr("malloc");
+
+    struct SharedStorage* shared_storage = mmap(
+        NULL,
+        sizeof(struct SharedStorage),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_ANONYMOUS,
+        -1,
+        0);
+
+    for (int i = 0; i < MAX_N_TASKS; i++) {
+        char num[3];
+        sprintf(num, "%d", i);
+        strcat(mutex_names[i], mutex_name);
+        strcat(mutex_names[i], num);
+
+        shared_storage->tasks[i].mutex = *sem_open(mutex_names[i], O_CREAT | O_RDWR, S_IRUSR | S_IWUSR, 1);
     }
+
+    if (shared_storage == MAP_FAILED)
+        syserr("mmap");
 
     bool quits = false;
     int next_task = 0;
 
     pid_t pid;
+    int t;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
@@ -87,16 +144,15 @@ int main()
         }
 
         remove_newline(buffer);
-
         parts = split_string(buffer);
 
         switch (get_command(parts[0])) {
         case RUN:
-            tasks[next_task].args = parts;
+            shared_storage->tasks[next_task].args = parts;
             if ((pid = fork()) < 0)
                 exit(1);
             else if (pid == 0) {
-                run(&tasks[next_task]);
+                run(next_task, shared_storage);
                 return 0;
             } else {
                 printf("Task %d started: pid %d\n", next_task, pid);
@@ -104,6 +160,9 @@ int main()
             }
             break;
         case OUT:
+            // TODO mutex
+            t = strtol(parts[1], NULL, 10);
+            printf("Task %d stdout: \'%s\'.\n", t, shared_storage->tasks[t].stdout);
             break;
         case ERR:
             break;
@@ -119,7 +178,13 @@ int main()
     }
 
     for (size_t i = 0; i < next_task - 1; i++)
-        ASSERT_SYS_OK(pthread_join(tasks[i].thread, NULL));
+        ASSERT_SYS_OK(pthread_join(shared_storage->tasks[i].thread, NULL));
+
+    for (int i = 0; i < MAX_N_TASKS; i++) {
+        ASSERT_SYS_OK(sem_destroy(&shared_storage->tasks[i].mutex));
+        ASSERT_SYS_OK(sem_unlink(mutex_names[i]));
+    }
+    ASSERT_SYS_OK(munmap(NULL, sizeof(struct SharedStorage)));
 
     free(buffer);
 
