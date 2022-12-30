@@ -87,6 +87,9 @@ void run(int t, struct SharedStorage* s)
         ASSERT_SYS_OK(stdout_pid);
 
         int k = !stdout_pid ? 1 : 0;
+        // Split into processes with k = 0, 1, which handle
+        // immediate stdout, stderr read, respectively.
+
         ASSERT_SYS_OK(close(pipefd[k][1]));
 
         FILE* fstream = fdopen(pipefd[k][0], "r");
