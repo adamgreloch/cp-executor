@@ -12,13 +12,14 @@
 #define COMMAND_LENGTH 511
 #define LINE_LENGTH 1022
 #define MAX_N_TASKS 4096
+#define STDOUT 0
+#define STDERR 1
 
 struct Task {
     pthread_t thread;
     char** args;
-    char stdout[LINE_LENGTH];
-    char stderr[LINE_LENGTH];
-    sem_t mutex;
+    char output[2][LINE_LENGTH];
+    sem_t mutex[2];
 };
 
 typedef struct Task Task;
@@ -29,14 +30,15 @@ struct SharedStorage {
 
 enum command { RUN, OUT, ERR, KILL, SLEEP, QUIT };
 
-char* run_str = "run";
-char* out_str = "out";
-char* err_str = "err";
-char* kill_str = "kill";
-char* sleep_str = "sleep";
+const char* run_str = "run";
+const char* out_str = "out";
+const char* err_str = "err";
+const char* kill_str = "kill";
+const char* sleep_str = "sleep";
+const char* output_str[2] = { "stdout", "stderr" };
+const char* mutex_name[2] = { "/executor_mutex_o", "/executor_mutex_e" };
 
-char mutex_names[MAX_N_TASKS][20];
-const char* mutex_name = "/executor_mutex";
+char mutex_names[2][MAX_N_TASKS][22];
 
 void remove_newline(char* str)
 {
@@ -62,34 +64,45 @@ enum command get_command(char* str)
 
 void run(int t, struct SharedStorage* s)
 {
-    int pipefd[2];
+    int pipefd[2][2];
     Task* task = &s->tasks[t];
 
-    ASSERT_SYS_OK(pipe(pipefd));
+    for (int k = 0; k < 2; k++)
+        ASSERT_SYS_OK(pipe(pipefd[k]));
 
-    pid_t pid = fork();
-    ASSERT_SYS_OK(pid);
+    pid_t exec_pid = fork();
+    ASSERT_SYS_OK(exec_pid);
 
-    if (pid == 0) {
-        ASSERT_SYS_OK(close(pipefd[0]));
-
-        ASSERT_SYS_OK(dup2(pipefd[1], STDOUT_FILENO));
-        ASSERT_SYS_OK(close(pipefd[1]));
+    if (exec_pid == 0) {
+        for (int k = 0; k < 2; k++) {
+            ASSERT_SYS_OK(close(pipefd[k][0]));
+            ASSERT_SYS_OK(
+                dup2(pipefd[k][1], !k ? STDOUT_FILENO : STDERR_FILENO));
+            ASSERT_SYS_OK(close(pipefd[k][1]));
+        }
 
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
-        ASSERT_SYS_OK(close(pipefd[1]));
+        pid_t stdout_pid = fork();
+        ASSERT_SYS_OK(stdout_pid);
 
-        FILE* fstream = fdopen(pipefd[0], "r");
+        int k = !stdout_pid ? 1 : 0;
+        ASSERT_SYS_OK(close(pipefd[k][1]));
+
+        FILE* fstream = fdopen(pipefd[k][0], "r");
+        if (!fstream)
+            syserr("fdopen");
 
         char* buff = calloc(LINE_LENGTH, sizeof(char));
+        if (!buff)
+            syserr("calloc");
 
         while (read_line(buff, LINE_LENGTH, fstream))
             if (buff[0] != '\0') {
                 remove_newline(buff);
-                ASSERT_SYS_OK(sem_wait(&task->mutex));
-                strcpy(task->stdout, buff);
-                ASSERT_SYS_OK(sem_post(&task->mutex));
+                ASSERT_SYS_OK(sem_wait(&task->mutex[k]));
+                strcpy(task->output[k], buff);
+                ASSERT_SYS_OK(sem_post(&task->mutex[k]));
             }
 
         free(buff);
@@ -97,9 +110,36 @@ void run(int t, struct SharedStorage* s)
     }
 }
 
+void mutexes_init(struct SharedStorage* s)
+{
+    for (int i = 0; i < MAX_N_TASKS; i++) {
+        char num[4];
+        sprintf(num, "%d", i);
+        for (int k = 0; k < 2; k++) {
+            strcat(mutex_names[k][i], mutex_name[k]);
+            strcat(mutex_names[k][i], num);
+
+            sem_t* sem = sem_open(mutex_names[k][i], O_CREAT | O_RDWR | O_EXCL,
+                S_IRUSR | S_IWUSR, 1);
+
+            if (sem == SEM_FAILED)
+                syserr("sem_open");
+
+            s->tasks[i].mutex[k] = *sem;
+        }
+    }
+}
+
+void print_output(int t, int k, struct SharedStorage* s)
+{
+    ASSERT_SYS_OK(sem_wait(&s->tasks[t].mutex[k]));
+    printf("Task %d %s: \'%s\'.\n", t, output_str[k], s->tasks[t].output[k]);
+    ASSERT_SYS_OK(sem_post(&s->tasks[t].mutex[k]));
+}
+
 int main()
 {
-    size_t buffer_size = COMMAND_LENGTH;
+    int buffer_size = COMMAND_LENGTH;
     char* buffer = malloc(buffer_size * sizeof(char));
     char** parts;
 
@@ -110,24 +150,15 @@ int main()
         = mmap(NULL, sizeof(struct SharedStorage), PROT_READ | PROT_WRITE,
             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
-    for (int i = 0; i < MAX_N_TASKS; i++) {
-        char num[3];
-        sprintf(num, "%d", i);
-        strcat(mutex_names[i], mutex_name);
-        strcat(mutex_names[i], num);
-
-        shared_storage->tasks[i].mutex
-            = *sem_open(mutex_names[i], O_CREAT | O_RDWR, S_IRUSR | S_IWUSR, 1);
-    }
-
     if (shared_storage == MAP_FAILED)
         syserr("mmap");
+
+    mutexes_init(shared_storage);
 
     bool quits = false;
     int next_task = 0;
 
     pid_t pid;
-    int t;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
@@ -151,17 +182,6 @@ int main()
                 next_task++;
             }
             break;
-        case OUT:
-            t = strtol(parts[1], NULL, 10);
-            ASSERT_SYS_OK(sem_wait(&shared_storage->tasks[t].mutex));
-            printf("Task %d stdout: \'%s\'.\n", t,
-                shared_storage->tasks[t].stdout);
-            ASSERT_SYS_OK(sem_post(&shared_storage->tasks[t].mutex));
-            free_split_string(parts);
-            break;
-        case ERR:
-            free_split_string(parts);
-            break;
         case KILL:
             free_split_string(parts);
             break;
@@ -173,6 +193,14 @@ int main()
             quits = true;
             free_split_string(parts);
             break;
+        case ERR:
+            print_output(strtol(parts[1], NULL, 10), STDERR, shared_storage);
+            free_split_string(parts);
+            break;
+        case OUT:
+            print_output(strtol(parts[1], NULL, 10), STDOUT, shared_storage);
+            free_split_string(parts);
+            break;
         }
     }
 
@@ -181,7 +209,9 @@ int main()
         ASSERT_SYS_OK(pthread_join(shared_storage->tasks[i].thread, NULL));
 
     for (int i = 0; i < MAX_N_TASKS; i++)
-        ASSERT_SYS_OK(sem_unlink(mutex_names[i]));
+        for (int k = 0; k < 2; k++)
+            ASSERT_SYS_OK(sem_unlink(mutex_names[k][i]));
+
     // After unlink the OS will reclaim semaphore's resources once its reference
     // count drops to zero.
 
