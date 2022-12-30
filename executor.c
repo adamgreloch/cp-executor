@@ -27,14 +27,7 @@ struct SharedStorage {
     Task tasks[MAX_N_TASKS];
 };
 
-enum command {
-    RUN,
-    OUT,
-    ERR,
-    KILL,
-    SLEEP,
-    QUIT
-};
+enum command { RUN, OUT, ERR, KILL, SLEEP, QUIT };
 
 char* run_str = "run";
 char* out_str = "out";
@@ -94,7 +87,9 @@ void run(int t, struct SharedStorage* s)
         while (read_line(buff, LINE_LENGTH, fstream))
             if (buff[0] != '\0') {
                 remove_newline(buff);
+                ASSERT_SYS_OK(sem_wait(&task->mutex));
                 strcpy(task->stdout, buff);
+                ASSERT_SYS_OK(sem_post(&task->mutex));
             }
 
         free(buff);
@@ -111,13 +106,9 @@ int main()
     if (!buffer)
         syserr("malloc");
 
-    struct SharedStorage* shared_storage = mmap(
-        NULL,
-        sizeof(struct SharedStorage),
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED | MAP_ANONYMOUS,
-        -1,
-        0);
+    struct SharedStorage* shared_storage
+        = mmap(NULL, sizeof(struct SharedStorage), PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
     for (int i = 0; i < MAX_N_TASKS; i++) {
         char num[3];
@@ -125,7 +116,8 @@ int main()
         strcat(mutex_names[i], mutex_name);
         strcat(mutex_names[i], num);
 
-        shared_storage->tasks[i].mutex = *sem_open(mutex_names[i], O_CREAT | O_RDWR, S_IRUSR | S_IWUSR, 1);
+        shared_storage->tasks[i].mutex
+            = *sem_open(mutex_names[i], O_CREAT | O_RDWR, S_IRUSR | S_IWUSR, 1);
     }
 
     if (shared_storage == MAP_FAILED)
@@ -160,31 +152,40 @@ int main()
             }
             break;
         case OUT:
-            // TODO mutex
             t = strtol(parts[1], NULL, 10);
-            printf("Task %d stdout: \'%s\'.\n", t, shared_storage->tasks[t].stdout);
+            ASSERT_SYS_OK(sem_wait(&shared_storage->tasks[t].mutex));
+            printf("Task %d stdout: \'%s\'.\n", t,
+                shared_storage->tasks[t].stdout);
+            ASSERT_SYS_OK(sem_post(&shared_storage->tasks[t].mutex));
+            free_split_string(parts);
             break;
         case ERR:
+            free_split_string(parts);
             break;
         case KILL:
+            free_split_string(parts);
             break;
         case SLEEP:
             usleep(strtol(parts[1], NULL, 10));
+            free_split_string(parts);
             break;
         case QUIT:
             quits = true;
+            free_split_string(parts);
             break;
         }
     }
 
-    for (size_t i = 0; i < next_task - 1; i++)
+    // Temporary measure
+    for (int i = 0; i < next_task - 1; i++)
         ASSERT_SYS_OK(pthread_join(shared_storage->tasks[i].thread, NULL));
 
-    for (int i = 0; i < MAX_N_TASKS; i++) {
-        ASSERT_SYS_OK(sem_destroy(&shared_storage->tasks[i].mutex));
+    for (int i = 0; i < MAX_N_TASKS; i++)
         ASSERT_SYS_OK(sem_unlink(mutex_names[i]));
-    }
-    ASSERT_SYS_OK(munmap(NULL, sizeof(struct SharedStorage)));
+    // After unlink the OS will reclaim semaphore's resources once its reference
+    // count drops to zero.
+
+    ASSERT_SYS_OK(munmap((void*)shared_storage, sizeof(struct SharedStorage)));
 
     free(buffer);
 
