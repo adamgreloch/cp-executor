@@ -1,12 +1,12 @@
 #include "err.h"
 #include "utils.h"
 #include <fcntl.h>
-#include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define COMMAND_LENGTH 511
@@ -233,9 +233,11 @@ int main()
         signal_handler(s);
     }
 
+    ASSERT_SYS_OK(wait(&pid));
+
     // Temporary measure
     for (int i = 0; i < s->next - 1; i++)
-        ASSERT_SYS_OK(pthread_join(s->tasks[i].thread, NULL));
+        ASSERT_SYS_OK(wait(&s->tasks[i].pid));
 
     for (int i = 0; i < MAX_N_TASKS; i++)
         for (int k = 0; k < 2; k++)
