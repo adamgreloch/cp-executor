@@ -29,7 +29,7 @@ struct SharedStorage {
     Task tasks[MAX_N_TASKS];
 };
 
-enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT };
+enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT, EMPTY };
 
 const char* run_str = "run";
 const char* out_str = "out";
@@ -60,6 +60,8 @@ enum cmd get_cmd(char* str)
         return KILL;
     if (strcmp(str, sleep_str) == 0)
         return SLEEP;
+    if (strcmp(str, "") == 0)
+        return EMPTY;
     return QUIT;
 }
 
@@ -125,7 +127,7 @@ void mutexes_init(struct SharedStorage* s)
             strcat(mutex_names[k][i], mutex_name[k]);
             strcat(mutex_names[k][i], num);
 
-            sem_t* sem = sem_open(mutex_names[k][i], O_CREAT | O_RDWR | O_EXCL,
+            sem_t* sem = sem_open(mutex_names[k][i], O_CREAT | O_RDWR,
                 S_IRUSR | S_IWUSR, 1);
 
             if (sem == SEM_FAILED)
@@ -175,7 +177,7 @@ void cmd_dispatcher(struct SharedStorage* s)
                 exit(1);
             else if (task_pid == 0) {
                 run(next, s);
-                return;
+                exit(0);
             } else {
                 printf("Task %d started: task_pid %d\n", next, task_pid);
                 next++;
@@ -201,6 +203,8 @@ void cmd_dispatcher(struct SharedStorage* s)
         case OUT:
             print_output(strtol(parts[1], NULL, 10), STDOUT, s);
             free_split_string(parts);
+            break;
+        case EMPTY:
             break;
         }
     }
