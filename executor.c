@@ -16,6 +16,7 @@
 #define STDERR 1
 
 struct Task {
+    pid_t pid;
     pthread_t thread;
     char** args;
     char output[2][LINE_LENGTH];
@@ -28,7 +29,7 @@ struct SharedStorage {
     Task tasks[MAX_N_TASKS];
 };
 
-enum command { RUN, OUT, ERR, KILL, SLEEP, QUIT };
+enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT };
 
 const char* run_str = "run";
 const char* out_str = "out";
@@ -47,7 +48,7 @@ void remove_newline(char* str)
         strncpy(ptr, "\0", 1);
 }
 
-enum command get_command(char* str)
+enum cmd get_cmd(char* str)
 {
     if (strcmp(str, run_str) == 0)
         return RUN;
@@ -149,19 +150,18 @@ int main()
     if (!buffer)
         syserr("malloc");
 
-    struct SharedStorage* shared_storage
-        = mmap(NULL, sizeof(struct SharedStorage), PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    struct SharedStorage* s = mmap(NULL, sizeof(struct SharedStorage),
+        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
-    if (shared_storage == MAP_FAILED)
+    if (s == MAP_FAILED)
         syserr("mmap");
 
-    mutexes_init(shared_storage);
+    mutexes_init(s);
 
     bool quits = false;
-    int next_task = 0;
+    int next = 0;
 
-    pid_t pid;
+    pid_t task_pid;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
@@ -172,17 +172,18 @@ int main()
         remove_newline(buffer);
         parts = split_string(buffer);
 
-        switch (get_command(parts[0])) {
+        switch (get_cmd(parts[0])) {
         case RUN:
-            shared_storage->tasks[next_task].args = parts;
-            if ((pid = fork()) < 0)
+            s->tasks[next].args = parts;
+            if ((task_pid = fork()) < 0)
                 exit(1);
-            else if (pid == 0) {
-                run(next_task, shared_storage);
+            else if (task_pid == 0) {
+                run(next, s);
                 return 0;
             } else {
-                printf("Task %d started: pid %d\n", next_task, pid);
-                next_task++;
+                printf("Task %d started: task_pid %d\n", next, task_pid);
+                s->tasks[next].pid = task_pid;
+                next++;
             }
             break;
         case KILL:
@@ -197,19 +198,19 @@ int main()
             free_split_string(parts);
             break;
         case ERR:
-            print_output(strtol(parts[1], NULL, 10), STDERR, shared_storage);
+            print_output(strtol(parts[1], NULL, 10), STDERR, s);
             free_split_string(parts);
             break;
         case OUT:
-            print_output(strtol(parts[1], NULL, 10), STDOUT, shared_storage);
+            print_output(strtol(parts[1], NULL, 10), STDOUT, s);
             free_split_string(parts);
             break;
         }
     }
 
     // Temporary measure
-    for (int i = 0; i < next_task - 1; i++)
-        ASSERT_SYS_OK(pthread_join(shared_storage->tasks[i].thread, NULL));
+    for (int i = 0; i < next - 1; i++)
+        ASSERT_SYS_OK(pthread_join(s->tasks[i].thread, NULL));
 
     for (int i = 0; i < MAX_N_TASKS; i++)
         for (int k = 0; k < 2; k++)
@@ -218,7 +219,7 @@ int main()
     // After unlink the OS will reclaim semaphore's resources once its reference
     // count drops to zero.
 
-    ASSERT_SYS_OK(munmap((void*)shared_storage, sizeof(struct SharedStorage)));
+    ASSERT_SYS_OK(munmap((void*)s, sizeof(struct SharedStorage)));
 
     free(buffer);
 
