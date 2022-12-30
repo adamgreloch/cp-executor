@@ -27,10 +27,6 @@ typedef struct Task Task;
 
 struct SharedStorage {
     Task tasks[MAX_N_TASKS];
-    char* buffer;
-    char** parts;
-    int next;
-    pid_t handler_pid;
 };
 
 enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT };
@@ -85,6 +81,8 @@ void run(int t, struct SharedStorage* s)
                 dup2(pipefd[k][1], !k ? STDOUT_FILENO : STDERR_FILENO));
             ASSERT_SYS_OK(close(pipefd[k][1]));
         }
+
+        task->pid = getpid();
 
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
@@ -150,60 +148,64 @@ const int buffer_size = COMMAND_LENGTH;
 void cmd_dispatcher(struct SharedStorage* s)
 {
     bool quits = false;
-    s->next = 0;
+    char* buffer = malloc(buffer_size * sizeof(char));
+
+    if (!buffer)
+        syserr("malloc");
+
+    char** parts;
+
+    int next = 0;
 
     pid_t task_pid;
 
     while (!quits) {
-        if (!read_line(s->buffer, buffer_size, stdin)) {
+        if (!read_line(buffer, buffer_size, stdin)) {
             quits = true;
             break;
         }
 
-        remove_newline(s->buffer);
-        s->parts = split_string(s->buffer);
+        remove_newline(buffer);
+        parts = split_string(buffer);
 
-        switch (get_cmd(s->parts[0])) {
+        switch (get_cmd(parts[0])) {
         case RUN:
-            s->tasks[s->next].args = s->parts;
+            s->tasks[next].args = parts;
             if ((task_pid = fork()) < 0)
                 exit(1);
             else if (task_pid == 0) {
-                run(s->next, s);
+                run(next, s);
                 return;
             } else {
-                printf("Task %d started: task_pid %d\n", s->next, task_pid);
-                s->tasks[s->next].pid = task_pid;
-                s->next++;
+                printf("Task %d started: task_pid %d\n", next, task_pid);
+                next++;
             }
             break;
         case KILL:
-            free_split_string(s->parts);
+            free_split_string(parts);
             break;
         case SLEEP:
-            usleep(strtol(s->parts[1], NULL, 10));
-            free_split_string(s->parts);
+            usleep(strtol(parts[1], NULL, 10));
+            free_split_string(parts);
             break;
         case QUIT:
             quits = true;
-            free_split_string(s->parts);
+            for (int i = 0; i < next - 1; i++)
+                ASSERT_SYS_OK(kill(s->tasks[i].pid, SIGKILL));
+            free_split_string(parts);
             break;
         case ERR:
-            print_output(strtol(s->parts[1], NULL, 10), STDERR, s);
-            free_split_string(s->parts);
+            print_output(strtol(parts[1], NULL, 10), STDERR, s);
+            free_split_string(parts);
             break;
         case OUT:
-            print_output(strtol(s->parts[1], NULL, 10), STDOUT, s);
-            free_split_string(s->parts);
+            print_output(strtol(parts[1], NULL, 10), STDOUT, s);
+            free_split_string(parts);
             break;
         }
     }
-    // TODO signal quitting to parent
-}
 
-void signal_handler(struct SharedStorage* s)
-{
-    // TODO handle signals in loop
+    free(buffer);
 }
 
 int main()
@@ -214,30 +216,9 @@ int main()
     if (s == MAP_FAILED)
         syserr("mmap");
 
-    s->buffer = malloc(buffer_size * sizeof(char));
-
-    if (!s->buffer)
-        syserr("malloc");
-
     mutexes_init(s);
-    s->handler_pid = getpid();
 
-    pid_t pid = fork();
-    // Split into cmd_dispatcher and signal_handler
-    ASSERT_SYS_OK(pid);
-
-    if (pid == 0) {
-        cmd_dispatcher(s);
-        return 0;
-    } else {
-        signal_handler(s);
-    }
-
-    ASSERT_SYS_OK(wait(&pid));
-
-    // Temporary measure
-    for (int i = 0; i < s->next - 1; i++)
-        ASSERT_SYS_OK(wait(&s->tasks[i].pid));
+    cmd_dispatcher(s);
 
     for (int i = 0; i < MAX_N_TASKS; i++)
         for (int k = 0; k < 2; k++)
@@ -245,9 +226,6 @@ int main()
 
     // After unlink the OS will reclaim semaphore's resources once its reference
     // count drops to zero.
-
-    free(s->buffer);
-
     ASSERT_SYS_OK(munmap((void*)s, sizeof(struct SharedStorage)));
 
     return 0;
