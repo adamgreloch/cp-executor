@@ -1,11 +1,11 @@
 #include "err.h"
 #include "utils.h"
 #include <fcntl.h>
+#include <pthread.h>
 #include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -15,19 +15,24 @@
 #define STDOUT 0
 #define STDERR 1
 
+#define DEBUG 0
+
 struct Task {
-    pid_t pid;
-    pthread_t thread;
+    // thread 0 runs the task while threads 1,2 listen for stdout/err
+    // thread 4 finishes
+    pthread_t thread[4];
+    pid_t exec_pid;
+
+    int id;
     char** args;
     char output[2][LINE_LENGTH];
-    sem_t mutex[2];
+    int pipefd[2][2];
+    pthread_mutex_t mutex[2];
 };
 
 typedef struct Task Task;
 
-struct SharedStorage {
-    Task tasks[MAX_N_TASKS];
-};
+Task tasks[MAX_N_TASKS];
 
 enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT, EMPTY };
 
@@ -37,9 +42,6 @@ const char* err_str = "err";
 const char* kill_str = "kill";
 const char* sleep_str = "sleep";
 const char* output_str[2] = { "stdout", "stderr" };
-const char* mutex_name[2] = { "/executor_mutex_o", "/executor_mutex_e" };
-
-char mutex_names[2][MAX_N_TASKS][22];
 
 void remove_newline(char* str)
 {
@@ -50,6 +52,7 @@ void remove_newline(char* str)
 
 enum cmd get_cmd(char* str)
 {
+    printf("%d got %s\n", getpid(), str);
     if (strcmp(str, run_str) == 0)
         return RUN;
     if (strcmp(str, out_str) == 0)
@@ -65,89 +68,113 @@ enum cmd get_cmd(char* str)
     return QUIT;
 }
 
-void run(int t, struct SharedStorage* s)
+// takes arg array as argument. arg[0] - task number, arg[1] -
+// listened fd
+void* output_listener(void* p)
 {
-    int pipefd[2][2];
-    Task* task = &s->tasks[t];
+    int* s = p;
+
+    Task* task = &tasks[s[0]];
+    int k = s[1] == STDOUT_FILENO;
+
+    int fd = task->pipefd[k][0];
+
+    FILE* fs = fdopen(fd, "r");
+    if (!fs)
+        syserr("fdopen");
+
+    size_t buff_size = LINE_LENGTH;
+
+    char* bf = calloc(buff_size, sizeof(char));
+    if (!bf)
+        syserr("calloc");
+
+    ssize_t read;
+
+    while ((read = getline(&bf, &buff_size, fs)) && read > 0) {
+        remove_newline(bf);
+        if (DEBUG)
+            printf("got \'%s\', k=%d\n", bf, k);
+        ASSERT_ZERO(pthread_mutex_lock(&task->mutex[k]));
+        strcpy(task->output[k], bf);
+        ASSERT_ZERO(pthread_mutex_unlock(&task->mutex[k]));
+    }
+
+    if (DEBUG)
+        printf("Left loop\n");
+
+    fclose(fs);
+    free(bf);
+}
+
+void* run(void* p)
+{
+    int t = *(int*)p;
+
+    Task* task = &tasks[t];
+
+    for (int k = 0; k < 2; k++) {
+        ASSERT_SYS_OK(pipe(task->pipefd[k]));
+    }
+
+    int args[2][2] = { { t, STDOUT_FILENO }, { t, STDERR_FILENO } };
 
     for (int k = 0; k < 2; k++)
-        ASSERT_SYS_OK(pipe(pipefd[k]));
+        ASSERT_ZERO(pthread_create(
+            &task->thread[k + 1], NULL, output_listener, &args[k]));
 
-    pid_t exec_pid = fork();
-    ASSERT_SYS_OK(exec_pid);
+    pid_t task_pid;
+    ASSERT_SYS_OK(task_pid = fork());
 
-    if (exec_pid == 0) {
+    if (task_pid == 0) {
+        int output;
         for (int k = 0; k < 2; k++) {
-            ASSERT_SYS_OK(close(pipefd[k][0]));
-            ASSERT_SYS_OK(
-                dup2(pipefd[k][1], !k ? STDOUT_FILENO : STDERR_FILENO));
-            ASSERT_SYS_OK(close(pipefd[k][1]));
+            ASSERT_SYS_OK(close(task->pipefd[k][0]));
+            output = !k ? STDOUT_FILENO : STDERR_FILENO;
+            ASSERT_SYS_OK(dup2(task->pipefd[k][1], output));
+            ASSERT_SYS_OK(close(task->pipefd[k][1]));
         }
-
-        task->pid = getpid();
-
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
-        pid_t stdout_pid = fork();
-        ASSERT_SYS_OK(stdout_pid);
+        for (int k = 0; k < 2; k++)
+            ASSERT_SYS_OK(close(task->pipefd[k][1]));
+        task->exec_pid = task_pid;
+        printf("Task %d started: pid %d.\n", t, task_pid);
 
-        int k = !stdout_pid ? 1 : 0;
-        // Split into processes with k = 0, 1, which handle
-        // immediate stdout, stderr read, respectively.
+        int status;
+        waitpid(tasks[t].exec_pid, &status, 0);
 
-        ASSERT_SYS_OK(close(pipefd[k][1]));
-
-        FILE* fstream = fdopen(pipefd[k][0], "r");
-        if (!fstream)
-            syserr("fdopen");
-
-        char* buff = calloc(LINE_LENGTH, sizeof(char));
-        if (!buff)
-            syserr("calloc");
-
-        while (read_line(buff, LINE_LENGTH, fstream))
-            if (buff[0] != '\0') {
-                remove_newline(buff);
-                ASSERT_SYS_OK(sem_wait(&task->mutex[k]));
-                strcpy(task->output[k], buff);
-                ASSERT_SYS_OK(sem_post(&task->mutex[k]));
-            }
-
-        free(buff);
-        free_split_string(task->args);
+        if (status < 0)
+            printf("Task %d ended: signalled.\n", t);
+        else
+            printf("Task %d ended: status %d.\n", t, status);
     }
 }
 
-void mutexes_init(struct SharedStorage* s)
+void mutexes_init()
 {
-    for (int i = 0; i < MAX_N_TASKS; i++) {
-        char num[4];
-        sprintf(num, "%d", i);
-        for (int k = 0; k < 2; k++) {
-            strcat(mutex_names[k][i], mutex_name[k]);
-            strcat(mutex_names[k][i], num);
-
-            sem_t* sem = sem_open(mutex_names[k][i], O_CREAT | O_RDWR,
-                S_IRUSR | S_IWUSR, 1);
-
-            if (sem == SEM_FAILED)
-                syserr("sem_open");
-
-            s->tasks[i].mutex[k] = *sem;
-        }
-    }
+    for (int i = 0; i < MAX_N_TASKS; i++)
+        for (int k = 0; k < 2; k++)
+            ASSERT_ZERO(pthread_mutex_init(&tasks[i].mutex[k], NULL));
 }
 
-void print_output(int t, int k, struct SharedStorage* s)
+void mutexes_destroy()
 {
-    ASSERT_SYS_OK(sem_wait(&s->tasks[t].mutex[k]));
-    printf("Task %d %s: \'%s\'.\n", t, output_str[k], s->tasks[t].output[k]);
-    ASSERT_SYS_OK(sem_post(&s->tasks[t].mutex[k]));
+    for (int i = 0; i < MAX_N_TASKS; i++)
+        for (int k = 0; k < 2; k++)
+            ASSERT_ZERO(pthread_mutex_destroy(&tasks[i].mutex[k]));
+}
+
+void print_output(int t, int k)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&tasks[t].mutex[k]));
+    printf("Task %d %s: \'%s\'.\n", t, output_str[k], tasks[t].output[k]);
+    ASSERT_ZERO(pthread_mutex_unlock(&tasks[t].mutex[k]));
 }
 
 const int buffer_size = COMMAND_LENGTH;
 
-void cmd_dispatcher(struct SharedStorage* s)
+void cmd_dispatcher()
 {
     bool quits = false;
     char* buffer = malloc(buffer_size * sizeof(char));
@@ -158,8 +185,6 @@ void cmd_dispatcher(struct SharedStorage* s)
     char** parts;
 
     int next = 0;
-
-    pid_t task_pid;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
@@ -172,16 +197,11 @@ void cmd_dispatcher(struct SharedStorage* s)
 
         switch (get_cmd(parts[0])) {
         case RUN:
-            s->tasks[next].args = parts;
-            if ((task_pid = fork()) < 0)
-                exit(1);
-            else if (task_pid == 0) {
-                run(next, s);
-                exit(0);
-            } else {
-                printf("Task %d started: task_pid %d\n", next, task_pid);
-                next++;
-            }
+            tasks[next].args = parts;
+            tasks[next].id = next;
+            ASSERT_ZERO(pthread_create(
+                &tasks[next].thread[0], NULL, run, &tasks[next].id));
+            next++;
             break;
         case KILL:
             free_split_string(parts);
@@ -192,16 +212,14 @@ void cmd_dispatcher(struct SharedStorage* s)
             break;
         case QUIT:
             quits = true;
-            for (int i = 0; i < next - 1; i++)
-                ASSERT_SYS_OK(kill(s->tasks[i].pid, SIGKILL));
             free_split_string(parts);
             break;
         case ERR:
-            print_output(strtol(parts[1], NULL, 10), STDERR, s);
+            print_output(strtol(parts[1], NULL, 10), STDERR);
             free_split_string(parts);
             break;
         case OUT:
-            print_output(strtol(parts[1], NULL, 10), STDOUT, s);
+            print_output(strtol(parts[1], NULL, 10), STDOUT);
             free_split_string(parts);
             break;
         case EMPTY:
@@ -209,28 +227,20 @@ void cmd_dispatcher(struct SharedStorage* s)
         }
     }
 
+    for (int i = 0; i < next - 1; i++)
+        for (int k = 0; k < 3; k++)
+            ASSERT_ZERO(pthread_join(tasks[i].thread[k], NULL));
+
     free(buffer);
 }
 
 int main()
 {
-    struct SharedStorage* s = mmap(NULL, sizeof(struct SharedStorage),
-        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    mutexes_init();
 
-    if (s == MAP_FAILED)
-        syserr("mmap");
+    cmd_dispatcher();
 
-    mutexes_init(s);
-
-    cmd_dispatcher(s);
-
-    for (int i = 0; i < MAX_N_TASKS; i++)
-        for (int k = 0; k < 2; k++)
-            ASSERT_SYS_OK(sem_unlink(mutex_names[k][i]));
-
-    // After unlink the OS will reclaim semaphore's resources once its reference
-    // count drops to zero.
-    ASSERT_SYS_OK(munmap((void*)s, sizeof(struct SharedStorage)));
+    mutexes_destroy();
 
     return 0;
 }
