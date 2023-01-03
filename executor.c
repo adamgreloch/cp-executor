@@ -52,7 +52,7 @@ void remove_newline(char* str)
 
 enum cmd get_cmd(char* str)
 {
-    printf("%d got %s\n", getpid(), str);
+    if (DEBUG) printf("%d got %s\n", getpid(), str);
     if (strcmp(str, run_str) == 0)
         return RUN;
     if (strcmp(str, out_str) == 0)
@@ -105,17 +105,17 @@ void* output_listener(void* p)
 
     fclose(fs);
     free(bf);
+
+    return 0;
 }
 
 void* run(void* p)
 {
     int t = *(int*)p;
-
     Task* task = &tasks[t];
 
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < 2; k++)
         ASSERT_SYS_OK(pipe(task->pipefd[k]));
-    }
 
     int args[2][2] = { { t, STDOUT_FILENO }, { t, STDERR_FILENO } };
 
@@ -129,11 +129,12 @@ void* run(void* p)
     if (task_pid == 0) {
         int output;
         for (int k = 0; k < 2; k++) {
-            ASSERT_SYS_OK(close(task->pipefd[k][0]));
             output = !k ? STDOUT_FILENO : STDERR_FILENO;
+            ASSERT_SYS_OK(close(task->pipefd[k][0]));
             ASSERT_SYS_OK(dup2(task->pipefd[k][1], output));
             ASSERT_SYS_OK(close(task->pipefd[k][1]));
         }
+        setpgid(0, 0);
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
         for (int k = 0; k < 2; k++)
@@ -141,14 +142,18 @@ void* run(void* p)
         task->exec_pid = task_pid;
         printf("Task %d started: pid %d.\n", t, task_pid);
 
-        int status;
-        waitpid(tasks[t].exec_pid, &status, 0);
+        int wstatus;
+        waitpid(tasks[t].exec_pid, &wstatus, 0);
 
-        if (status < 0)
+        if (WIFSIGNALED(wstatus))
             printf("Task %d ended: signalled.\n", t);
         else
-            printf("Task %d ended: status %d.\n", t, status);
+            printf("Task %d ended: status %d.\n", t, wstatus);
+
+        free_split_string(tasks[t].args);
     }
+
+    return 0;
 }
 
 void mutexes_init()
@@ -185,10 +190,13 @@ void cmd_dispatcher()
     char** parts;
 
     int next = 0;
+    int task_id, time;
 
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
             quits = true;
+            for (int id = 0; id < next; id++)
+                ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
             break;
         }
 
@@ -204,25 +212,33 @@ void cmd_dispatcher()
             next++;
             break;
         case KILL:
-            free_split_string(parts);
+            task_id = strtol(parts[1], NULL, 10);
+            if (DEBUG) printf("sigint %d\n", tasks[task_id].exec_pid);
+            ASSERT_SYS_OK(killpg(tasks[task_id].exec_pid, SIGINT));
             break;
         case SLEEP:
-            usleep(strtol(parts[1], NULL, 10));
+            time = strtol(parts[1], NULL, 10);
+            usleep(1000 * time);
             free_split_string(parts);
             break;
         case QUIT:
             quits = true;
+            for (int id = 0; id < next; id++)
+                ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
             free_split_string(parts);
             break;
         case ERR:
-            print_output(strtol(parts[1], NULL, 10), STDERR);
+            task_id = strtol(parts[1], NULL, 10);
+            print_output(task_id, STDERR);
             free_split_string(parts);
             break;
         case OUT:
-            print_output(strtol(parts[1], NULL, 10), STDOUT);
+            task_id = strtol(parts[1], NULL, 10);
+            print_output(task_id, STDOUT);
             free_split_string(parts);
             break;
         case EMPTY:
+            free_split_string(parts);
             break;
         }
     }
