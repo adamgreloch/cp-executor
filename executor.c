@@ -9,7 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-OutputLock outputLock;
+DispatcherLock dispatcherLock;
 
 Task tasks[MAX_N_TASKS];
 
@@ -63,10 +63,10 @@ void* run(void* task_id)
         ASSERT_ZERO(pthread_create(
             &task->thread[k + 1], NULL, output_listener, &args[k]));
 
-    pid_t task_pid;
-    ASSERT_SYS_OK(task_pid = fork());
+    pid_t exec_pid;
+    ASSERT_SYS_OK(exec_pid = fork());
 
-    if (task_pid == 0) {
+    if (exec_pid == 0) {
         int output;
         for (int k = 0; k < 2; k++) {
             output = !k ? STDOUT_FILENO : STDERR_FILENO;
@@ -74,25 +74,30 @@ void* run(void* task_id)
             ASSERT_SYS_OK(dup2(task->pipefd[k][1], output));
             ASSERT_SYS_OK(close(task->pipefd[k][1]));
         }
-        setpgid(0, 0);
+
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
         for (int k = 0; k < 2; k++)
             ASSERT_SYS_OK(close(task->pipefd[k][1]));
-        task->exec_pid = task_pid;
-        printf("Task %d started: pid %d.\n", t, task_pid);
+
+        setpgid(exec_pid, exec_pid);
+        task->exec_pid = exec_pid;
+
+        printf("Task %d started: pid %d.\n", t, exec_pid);
+
+        after_run(&dispatcherLock);
 
         int wstatus;
         waitpid(tasks[t].exec_pid, &wstatus, 0);
 
-        before_output(&outputLock);
+        before_output(&dispatcherLock);
 
         if (WIFSIGNALED(wstatus))
             printf("Task %d ended: signalled.\n", t);
         else
             printf("Task %d ended: status %d.\n", t, wstatus);
 
-        after_output(&outputLock);
+        after_output(&dispatcherLock);
 
         free_split_string(tasks[t].args);
     }
@@ -123,7 +128,7 @@ void run_dispatcher()
             break;
         }
 
-        before_dispatch(&outputLock);
+        before_dispatch(&dispatcherLock);
 
         remove_newline(buff);
         parts = split_string(buff);
@@ -134,6 +139,8 @@ void run_dispatcher()
             run_cmd = true;
             tasks[next].args = parts;
             tasks[next].id = next;
+
+            before_run(&dispatcherLock);
             ASSERT_ZERO(pthread_create(
                 &tasks[next].thread[0], NULL, run, &tasks[next].id));
             next++;
@@ -158,7 +165,7 @@ void run_dispatcher()
             break;
         }
 
-        after_dispatch(&outputLock);
+        after_dispatch(&dispatcherLock);
 
         if (!run_cmd)
             // RUN passes parts deallocation to thread executing run()
@@ -176,13 +183,13 @@ void run_dispatcher()
 
 int main()
 {
-    output_lock_init(&outputLock);
+    output_lock_init(&dispatcherLock);
     mutexes_init(tasks);
 
     run_dispatcher();
 
     mutexes_destroy(tasks);
-    output_lock_destroy(&outputLock);
+    output_lock_destroy(&dispatcherLock);
 
     return 0;
 }

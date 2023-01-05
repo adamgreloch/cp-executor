@@ -1,71 +1,99 @@
 #include "output_lock.h"
 #include "err.h"
+#include <stdio.h>
 
-void output_lock_init(OutputLock* ol)
+void output_lock_init(DispatcherLock* dl)
 {
-    ASSERT_ZERO(pthread_mutex_init(&ol->mutex, NULL));
-    ASSERT_ZERO(pthread_cond_init(&ol->dispatcher, NULL));
-    ASSERT_ZERO(pthread_cond_init(&ol->ended_tasks, NULL));
-    ol->ended_tasks_waiting = 0;
-    ol->ended_tasks_outputting = 0;
-    ol->dispatcher_running = true;
+    ASSERT_ZERO(pthread_mutex_init(&dl->mutex, NULL));
+    ASSERT_ZERO(pthread_cond_init(&dl->dispatcher, NULL));
+    ASSERT_ZERO(pthread_cond_init(&dl->ended_tasks, NULL));
+    dl->ended_tasks_waiting = 0;
+    dl->task_run_steps = 0;
+    dl->ended_tasks_outputting = 0;
+    dl->dispatcher_running = true;
 }
 
-void output_lock_destroy(OutputLock* ol)
+void output_lock_destroy(DispatcherLock* dl)
 {
-    ASSERT_ZERO(pthread_mutex_destroy(&ol->mutex));
-    ASSERT_ZERO(pthread_cond_destroy(&ol->dispatcher));
-    ASSERT_ZERO(pthread_cond_destroy(&ol->ended_tasks));
+    ASSERT_ZERO(pthread_mutex_destroy(&dl->mutex));
+    ASSERT_ZERO(pthread_cond_destroy(&dl->dispatcher));
+    ASSERT_ZERO(pthread_cond_destroy(&dl->ended_tasks));
 }
 
-void before_output(OutputLock* ol)
-{
-    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+// assumes no ended_tasks waiting
+void before_run(DispatcherLock* dl) {
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
 
-    while (ol->dispatcher_running) {
-        ol->ended_tasks_waiting++;
-        ASSERT_ZERO(pthread_cond_wait(&ol->ended_tasks, &ol->mutex));
-        ol->ended_tasks_waiting--;
+    dl->task_run_steps++;
+
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
+}
+
+// assumes no ended_tasks waiting
+void after_run(DispatcherLock* dl) {
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
+
+    dl->task_run_steps--;
+
+    if (dl->task_run_steps == 0) {
+        if (dl->ended_tasks_waiting > 0)
+            ASSERT_ZERO(pthread_cond_signal(&dl->ended_tasks));
+        else if (dl->ended_tasks_outputting == 0)
+            ASSERT_ZERO(pthread_cond_signal(&dl->dispatcher));
     }
 
-    ol->ended_tasks_outputting++;
-
-    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
 }
 
-void after_output(OutputLock* ol)
+void before_output(DispatcherLock* dl)
 {
-    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
 
-    ol->ended_tasks_outputting--;
+    while (dl->dispatcher_running) {
+        dl->ended_tasks_waiting++;
+        ASSERT_ZERO(pthread_cond_wait(&dl->ended_tasks, &dl->mutex));
+        dl->ended_tasks_waiting--;
+    }
 
-    if (ol->ended_tasks_waiting > 0)
-        ASSERT_ZERO(pthread_cond_signal(&ol->ended_tasks));
-    else if (ol->ended_tasks_outputting == 0)
-        ASSERT_ZERO(pthread_cond_signal(&ol->dispatcher));
+    dl->ended_tasks_outputting++;
 
-    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
 }
 
-void before_dispatch(OutputLock* ol)
+void after_output(DispatcherLock* dl)
 {
-    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
 
-    while (ol->ended_tasks_waiting + ol->ended_tasks_outputting > 0)
-        ASSERT_ZERO(pthread_cond_wait(&ol->dispatcher, &ol->mutex));
+    dl->ended_tasks_outputting--;
 
-    ol->dispatcher_running = true;
+    if (dl->ended_tasks_waiting > 0)
+        ASSERT_ZERO(pthread_cond_signal(&dl->ended_tasks));
+    else if (dl->ended_tasks_outputting + dl->task_run_steps == 0)
+        ASSERT_ZERO(pthread_cond_signal(&dl->dispatcher));
 
-    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
 }
 
-void after_dispatch(OutputLock* ol)
+void before_dispatch(DispatcherLock* dl)
 {
-    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
 
-    ol->dispatcher_running = false;
+    while (dl->ended_tasks_waiting + dl->ended_tasks_outputting
+            + dl->task_run_steps > 0)
+        ASSERT_ZERO(pthread_cond_wait(&dl->dispatcher, &dl->mutex));
 
-    ASSERT_ZERO(pthread_cond_signal(&ol->ended_tasks));
+    dl->dispatcher_running = true;
 
-    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
+}
+
+void after_dispatch(DispatcherLock* dl)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&dl->mutex));
+
+    dl->dispatcher_running = false;
+
+    ASSERT_ZERO(pthread_cond_signal(&dl->ended_tasks));
+
+    ASSERT_ZERO(pthread_mutex_unlock(&dl->mutex));
 }

@@ -4,27 +4,33 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-struct OutputLock {
+struct DispatcherLock {
     pthread_mutex_t mutex;
     pthread_cond_t dispatcher;
     pthread_cond_t ended_tasks;
+    pthread_cond_t run_step;
     bool dispatcher_running;
+    int task_run_steps;
     int ended_tasks_waiting;
     int ended_tasks_outputting;
 };
 
-typedef struct OutputLock OutputLock;
+typedef struct DispatcherLock DispatcherLock;
 
-void output_lock_init(OutputLock* ol);
+void before_run(DispatcherLock* dl);
 
-void output_lock_destroy(OutputLock* ol);
+void after_run(DispatcherLock* dl);
 
-void before_output(OutputLock* ol);
+void output_lock_init(DispatcherLock* dl);
 
-void after_output(OutputLock* ol);
+void output_lock_destroy(DispatcherLock* dl);
 
-void before_dispatch(OutputLock* ol);
+void before_output(DispatcherLock* dl);
 
-void after_dispatch(OutputLock* ol);
+void after_output(DispatcherLock* dl);
+
+void before_dispatch(DispatcherLock* dl);
+
+void after_dispatch(DispatcherLock* dl);
 
 #endif // MIMUW_FORK_OUTPUT_LOCK_H
