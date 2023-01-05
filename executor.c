@@ -32,6 +32,19 @@ struct Task {
 
 typedef struct Task Task;
 
+struct OutputLock {
+    pthread_mutex_t mutex;
+    pthread_cond_t dispatcher;
+    pthread_cond_t ended_tasks;
+    bool dispatcher_running;
+    int ended_tasks_waiting;
+    int ended_tasks_outputting;
+};
+
+typedef struct OutputLock OutputLock;
+
+OutputLock outputLock;
+
 Task tasks[MAX_N_TASKS];
 
 enum cmd { RUN, OUT, ERR, KILL, SLEEP, QUIT, EMPTY };
@@ -52,7 +65,8 @@ void remove_newline(char* str)
 
 enum cmd get_cmd(char* str)
 {
-    if (DEBUG) printf("%d got %s\n", getpid(), str);
+    if (DEBUG)
+        printf("%d got %s\n", getpid(), str);
     if (strcmp(str, run_str) == 0)
         return RUN;
     if (strcmp(str, out_str) == 0)
@@ -109,6 +123,65 @@ void* output_listener(void* p)
     return 0;
 }
 
+void before_output(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+
+    while (ol->dispatcher_running) {
+        ol->ended_tasks_waiting++;
+        ASSERT_ZERO(pthread_cond_wait(&ol->ended_tasks, &ol->mutex));
+        ol->ended_tasks_waiting--;
+    }
+
+    ol->ended_tasks_outputting++;
+
+    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+}
+
+void after_output(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+
+    ol->ended_tasks_outputting--;
+
+    if (ol->ended_tasks_waiting > 0)
+        ASSERT_ZERO(pthread_cond_signal(&ol->ended_tasks));
+    else if (ol->ended_tasks_outputting == 0)
+        ASSERT_ZERO(pthread_cond_signal(&ol->dispatcher));
+
+    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+}
+
+void before_dispatch(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+
+    while (ol->ended_tasks_waiting + ol->ended_tasks_outputting > 0)
+        ASSERT_ZERO(pthread_cond_wait(&ol->dispatcher, &ol->mutex));
+
+    ol->dispatcher_running = true;
+
+    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+}
+
+void after_dispatch(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_lock(&ol->mutex));
+
+    ol->dispatcher_running = false;
+
+    ASSERT_ZERO(pthread_cond_signal(&ol->ended_tasks));
+
+    ASSERT_ZERO(pthread_mutex_unlock(&ol->mutex));
+}
+
+void kill_all(int next_id)
+{
+    for (int id = 0; id < next_id; id++)
+        if (!waitpid(tasks[id].exec_pid, NULL, WNOHANG))
+            ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
+}
+
 void* run(void* p)
 {
     int t = *(int*)p;
@@ -145,10 +218,14 @@ void* run(void* p)
         int wstatus;
         waitpid(tasks[t].exec_pid, &wstatus, 0);
 
+        before_output(&outputLock);
+
         if (WIFSIGNALED(wstatus))
             printf("Task %d ended: signalled.\n", t);
         else
             printf("Task %d ended: status %d.\n", t, wstatus);
+
+        after_output(&outputLock);
 
         free_split_string(tasks[t].args);
     }
@@ -168,6 +245,23 @@ void mutexes_destroy()
     for (int i = 0; i < MAX_N_TASKS; i++)
         for (int k = 0; k < 2; k++)
             ASSERT_ZERO(pthread_mutex_destroy(&tasks[i].mutex[k]));
+}
+
+void output_lock_init(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_init(&ol->mutex, NULL));
+    ASSERT_ZERO(pthread_cond_init(&ol->dispatcher, NULL));
+    ASSERT_ZERO(pthread_cond_init(&ol->ended_tasks, NULL));
+    ol->ended_tasks_waiting = 0;
+    ol->ended_tasks_outputting = 0;
+    ol->dispatcher_running = true;
+}
+
+void output_lock_destroy(OutputLock* ol)
+{
+    ASSERT_ZERO(pthread_mutex_destroy(&ol->mutex));
+    ASSERT_ZERO(pthread_cond_destroy(&ol->dispatcher));
+    ASSERT_ZERO(pthread_cond_destroy(&ol->ended_tasks));
 }
 
 void print_output(int t, int k)
@@ -195,10 +289,11 @@ void cmd_dispatcher()
     while (!quits) {
         if (!read_line(buffer, buffer_size, stdin)) {
             quits = true;
-            for (int id = 0; id < next; id++)
-                ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
+            kill_all(next);
             break;
         }
+
+        before_dispatch(&outputLock);
 
         remove_newline(buffer);
         parts = split_string(buffer);
@@ -213,7 +308,8 @@ void cmd_dispatcher()
             break;
         case KILL:
             task_id = strtol(parts[1], NULL, 10);
-            if (DEBUG) printf("sigint %d\n", tasks[task_id].exec_pid);
+            if (DEBUG)
+                printf("sigint %d\n", tasks[task_id].exec_pid);
             ASSERT_SYS_OK(killpg(tasks[task_id].exec_pid, SIGINT));
             break;
         case SLEEP:
@@ -223,8 +319,7 @@ void cmd_dispatcher()
             break;
         case QUIT:
             quits = true;
-            for (int id = 0; id < next; id++)
-                ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
+            kill_all(next);
             free_split_string(parts);
             break;
         case ERR:
@@ -241,6 +336,8 @@ void cmd_dispatcher()
             free_split_string(parts);
             break;
         }
+
+        after_dispatch(&outputLock);
     }
 
     for (int i = 0; i < next - 1; i++)
@@ -252,11 +349,15 @@ void cmd_dispatcher()
 
 int main()
 {
+    output_lock_init(&outputLock);
+
     mutexes_init();
 
     cmd_dispatcher();
 
     mutexes_destroy();
+
+    output_lock_destroy(&outputLock);
 
     return 0;
 }
