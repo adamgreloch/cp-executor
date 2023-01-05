@@ -9,6 +9,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define DEBUG 0
+
 DispatcherLock dispatcherLock;
 
 Task tasks[MAX_N_TASKS];
@@ -90,14 +92,14 @@ void* run(void* task_id)
         int wstatus;
         waitpid(tasks[t].exec_pid, &wstatus, 0);
 
-        before_output(&dispatcherLock);
+        before_status(&dispatcherLock);
 
         if (WIFSIGNALED(wstatus))
             printf("Task %d ended: signalled.\n", t);
         else
             printf("Task %d ended: status %d.\n", t, WEXITSTATUS(wstatus));
 
-        after_output(&dispatcherLock);
+        after_status(&dispatcherLock);
 
         free_split_string(tasks[t].args);
     }
@@ -119,6 +121,7 @@ void run_dispatcher()
 
     int next = 0;
     int arg;
+    bool was_kill = false;
     bool run_cmd = false;
 
     while (!quits) {
@@ -130,9 +133,13 @@ void run_dispatcher()
 
         before_dispatch(&dispatcherLock);
 
+        if (was_kill) {
+            after_kill(&dispatcherLock);
+            was_kill = false;
+        }
+
         remove_newline(buff);
         parts = split_string(buff);
-        arg = (int)strtol(parts[1], NULL, 10);
 
         switch (get_cmd(parts[0])) {
         case RUN:
@@ -146,9 +153,15 @@ void run_dispatcher()
             next++;
             break;
         case KILL:
+            if (DEBUG) printf("gotta kill\n");
+            before_kill(&dispatcherLock);
+            arg = (int)strtol(parts[1], NULL, 10);
+            was_kill = true;
             ASSERT_SYS_OK(killpg(tasks[arg].exec_pid, SIGINT));
             break;
         case SLEEP:
+            if (DEBUG) printf("gotta sleep\n");
+            arg = (int)strtol(parts[1], NULL, 10);
             usleep(1000 * arg);
             break;
         case QUIT:
@@ -156,9 +169,11 @@ void run_dispatcher()
             kill_all(tasks, next);
             break;
         case ERR:
+            arg = (int)strtol(parts[1], NULL, 10);
             print_output(tasks, arg, STDERR);
             break;
         case OUT:
+            arg = (int)strtol(parts[1], NULL, 10);
             print_output(tasks, arg, STDOUT);
             break;
         case EMPTY:
