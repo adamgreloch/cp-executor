@@ -134,7 +134,6 @@ void run_dispatcher()
 
     int next = 0;
     int arg;
-    bool was_kill = false;
     bool run_cmd = false;
 
     while (!quits) {
@@ -146,10 +145,8 @@ void run_dispatcher()
 
         before_dispatch(&dispatcherLock);
 
-        if (was_kill) {
-            after_kill(&dispatcherLock);
-            was_kill = false;
-        }
+        if (DEBUG)
+            printf("#: %s", buff);
 
         remove_newline(buff);
         parts = split_string(buff);
@@ -168,10 +165,8 @@ void run_dispatcher()
         case KILL:
             if (DEBUG)
                 printf("gotta kill\n");
-            before_kill(&dispatcherLock);
             arg = (int)strtol(parts[1], NULL, 10);
-            was_kill = true;
-            ASSERT_SYS_OK(killpg(tasks[arg].exec_pid, SIGINT));
+            interrupt_task(tasks, arg);
             break;
         case SLEEP:
             if (DEBUG)
@@ -181,6 +176,8 @@ void run_dispatcher()
             break;
         case QUIT:
             quits = true;
+            if (DEBUG)
+                printf("gotta quit\n");
             kill_all(tasks, next);
             break;
         case ERR:

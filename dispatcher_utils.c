@@ -38,11 +38,14 @@ enum cmd get_cmd(char* str)
     return QUIT;
 }
 
+void interrupt_task(Task tasks[], int id) {
+    killpg(tasks[id].exec_pid, SIGINT);
+}
+
 void kill_all(Task tasks[], int next_id)
 {
     for (int id = 0; id < next_id; id++)
-        if (!waitpid(tasks[id].exec_pid, NULL, WNOHANG))
-            ASSERT_SYS_OK(killpg(tasks[id].exec_pid, SIGINT));
+        killpg(tasks[id].exec_pid, SIGKILL);
 }
 
 void mutexes_init(Task tasks[])

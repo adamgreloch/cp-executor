@@ -36,6 +36,8 @@ enum cmd get_cmd(char* str);
 
 void remove_newline(char* str);
 
+void interrupt_task(Task tasks[], int id);
+
 void kill_all(Task tasks[], int next_id);
 
 void mutexes_init(Task tasks[]);
