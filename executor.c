@@ -15,14 +15,19 @@ DispatcherLock dispatcherLock;
 
 Task tasks[MAX_N_TASKS];
 
-// Takes int array[2] as an argument.
-// arg[0] - task number, arg[1] - listened fd id
-void* output_listener(void* int_arr)
-{
-    int* s = int_arr;
+struct ListenerArgs {
+    int task_id;
+    int fd_id;
+};
 
-    Task* task = &tasks[s[0]];
-    int k = s[1] == STDOUT_FILENO;
+typedef struct ListenerArgs ListenerArgs;
+
+void* output_listener(void* listenerArgs)
+{
+    ListenerArgs* ls = listenerArgs;
+
+    Task* task = &tasks[ls->task_id];
+    int k = ls->fd_id == STDOUT_FILENO ? 0 : 1;
 
     int fd = task->pipefd[k][0];
 
@@ -47,6 +52,7 @@ void* output_listener(void* int_arr)
 
     fclose(fs);
     free(bf);
+    free(ls);
 
     return 0;
 }
@@ -59,11 +65,18 @@ void* run(void* task_id)
     for (int k = 0; k < 2; k++)
         ASSERT_SYS_OK(pipe(task->pipefd[k]));
 
-    int args[2][2] = { { t, STDOUT_FILENO }, { t, STDERR_FILENO } };
+    ListenerArgs** args = malloc(2 * sizeof(ListenerArgs*));
+    args[0] = malloc(sizeof(ListenerArgs));
+    args[1] = malloc(sizeof(ListenerArgs));
 
-    for (int k = 0; k < 2; k++)
+    for (int k = 0; k < 2; k++) {
+        args[k]->task_id = t;
+        args[k]->fd_id = !k ? STDOUT_FILENO : STDERR_FILENO;
         ASSERT_ZERO(pthread_create(
-            &task->thread[k + 1], NULL, output_listener, &args[k]));
+            &task->thread[k + 1], NULL, output_listener, args[k]));
+    }
+
+    free(args);
 
     pid_t exec_pid;
     ASSERT_SYS_OK(exec_pid = fork());
@@ -125,7 +138,7 @@ void run_dispatcher()
     bool run_cmd = false;
 
     while (!quits) {
-        if (!read_line(buff, buff_size, stdin)) {
+        if (getline(&buff, &buff_size, stdin) < 0) {
             quits = true;
             kill_all(tasks, next);
             break;
@@ -153,14 +166,16 @@ void run_dispatcher()
             next++;
             break;
         case KILL:
-            if (DEBUG) printf("gotta kill\n");
+            if (DEBUG)
+                printf("gotta kill\n");
             before_kill(&dispatcherLock);
             arg = (int)strtol(parts[1], NULL, 10);
             was_kill = true;
             ASSERT_SYS_OK(killpg(tasks[arg].exec_pid, SIGINT));
             break;
         case SLEEP:
-            if (DEBUG) printf("gotta sleep\n");
+            if (DEBUG)
+                printf("gotta sleep\n");
             arg = (int)strtol(parts[1], NULL, 10);
             usleep(1000 * arg);
             break;
@@ -189,7 +204,7 @@ void run_dispatcher()
         run_cmd = false;
     }
 
-    for (int i = 0; i < next - 1; i++)
+    for (int i = 0; i < next; i++)
         for (int k = 0; k < 3; k++)
             ASSERT_ZERO(pthread_join(tasks[i].thread[k], NULL));
 
