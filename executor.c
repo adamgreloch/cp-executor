@@ -95,7 +95,7 @@ void* run(void* task_id)
         if (WIFSIGNALED(wstatus))
             printf("Task %d ended: signalled.\n", t);
         else
-            printf("Task %d ended: status %d.\n", t, wstatus);
+            printf("Task %d ended: status %d.\n", t, WEXITSTATUS(wstatus));
 
         after_output(&dispatcherLock);
 
