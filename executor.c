@@ -9,8 +9,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define DEBUG 0
-
 DispatcherLock dispatcherLock;
 
 Task tasks[MAX_N_TASKS];
@@ -66,8 +64,13 @@ void* run(void* task_id)
         ASSERT_SYS_OK(pipe(task->pipefd[k]));
 
     ListenerArgs** args = malloc(2 * sizeof(ListenerArgs*));
+    if (!args)
+        syserr("malloc");
+
     args[0] = malloc(sizeof(ListenerArgs));
     args[1] = malloc(sizeof(ListenerArgs));
+    if (!args[0] || !args[1])
+        syserr("malloc");
 
     for (int k = 0; k < 2; k++) {
         args[k]->task_id = t;
@@ -89,7 +92,6 @@ void* run(void* task_id)
             ASSERT_SYS_OK(dup2(task->pipefd[k][1], output));
             ASSERT_SYS_OK(close(task->pipefd[k][1]));
         }
-
         ASSERT_ZERO(execvp(task->args[1], task->args + 1));
     } else {
         for (int k = 0; k < 2; k++)
@@ -145,9 +147,6 @@ void run_dispatcher()
 
         before_dispatch(&dispatcherLock);
 
-        if (DEBUG)
-            printf("#: %s", buff);
-
         remove_newline(buff);
         parts = split_string(buff);
 
@@ -163,21 +162,15 @@ void run_dispatcher()
             next++;
             break;
         case KILL:
-            if (DEBUG)
-                printf("gotta kill\n");
             arg = (int)strtol(parts[1], NULL, 10);
             interrupt_task(tasks, arg);
             break;
         case SLEEP:
-            if (DEBUG)
-                printf("gotta sleep\n");
             arg = (int)strtol(parts[1], NULL, 10);
             usleep(1000 * arg);
             break;
         case QUIT:
             quits = true;
-            if (DEBUG)
-                printf("gotta quit\n");
             kill_all(tasks, next);
             break;
         case ERR:
@@ -195,8 +188,8 @@ void run_dispatcher()
         after_dispatch(&dispatcherLock);
 
         if (!run_cmd)
-            // RUN passes parts deallocation to thread executing run()
-            // otherwise, parts must be freed by the dispatcher.
+            // RUN passes deallocating of parts to a thread executing run()
+            // in case of other commands, parts must be freed by the dispatcher.
             free_split_string(parts);
         run_cmd = false;
     }
